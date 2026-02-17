@@ -11,11 +11,12 @@ This project follows the [SANS IO](https://sans-io.readthedocs.io/) pattern: pro
 | Crate | Description |
 |---|---|
 | [`webtransport`](webtransport/) | WebTransport over HTTP/3 ([draft-ietf-webtrans-http3-14](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/)) built on top of [quiche](https://github.com/cloudflare/quiche) |
-| `moq-protocol` | MoQ protocol messages and framing *(work in progress)* |
+| [`moq-protocol`](moq-protocol/) | MoQ Transport protocol ([draft-ietf-moq-transport-16](https://datatracker.ietf.org/doc/draft-ietf-moq-transport/)) — control messages, framing, encode/decode with sans-IO `Cursor` + `Vec<u8>` interface |
+| [`moq-relay`](moq-relay/) | MoQ relay server — session state machine, subscription management, request routing *(not yet implemented)* |
 
 ## Status
 
-**Early development.** The `webtransport` crate has a working implementation of session establishment, stream/datagram management, capsule framing, and flow control. The MoQ protocol layer (`moq-protocol`) and the top-level binary (`src/`) are not yet complete.
+**Early development.** The `webtransport` crate has a working implementation of session establishment, stream/datagram management, capsule framing, and flow control. The `moq-protocol` crate implements all control messages from draft-16 (SUBSCRIBE, PUBLISH, FETCH, namespace operations, session control, setup). The relay (`moq-relay`) is next.
 
 ## Building
 

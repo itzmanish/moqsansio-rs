@@ -1,0 +1,7 @@
+[package]
+name = "moq-relay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+moq-protocol = { path = "../moq-protocol" }

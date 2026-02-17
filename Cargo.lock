@@ -104,6 +104,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "moq-relay"
+version = "0.1.0"
+dependencies = [
+ "moq-protocol",
+]
+
+[[package]]
 name = "octets"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
