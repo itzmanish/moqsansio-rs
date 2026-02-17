@@ -157,6 +157,9 @@ pub fn decode_control_message(buf: &[u8]) -> Result<(ControlMessage, usize)> {
     let mut payload = outer.split(msg_len)?;
     let total_consumed = outer.position();
 
+    // Messages whose decoders intentionally consume remaining bytes (Track Extensions).
+    let has_trailing_extensions = matches!(msg_type, MSG_SUBSCRIBE_OK | MSG_PUBLISH | MSG_FETCH_OK);
+
     let msg = match msg_type {
         MSG_CLIENT_SETUP => ControlMessage::ClientSetup(ClientSetup::decode(&mut payload)?),
         MSG_SERVER_SETUP => ControlMessage::ServerSetup(ServerSetup::decode(&mut payload)?),
@@ -194,6 +197,15 @@ pub fn decode_control_message(buf: &[u8]) -> Result<(ControlMessage, usize)> {
         }
         _ => return Err(Error::UnknownMessageType(msg_type)),
     };
+
+    // Messages without trailing extensions must consume the entire payload.
+    // Unconsumed bytes indicate a malformed message (Section 9).
+    if !has_trailing_extensions && payload.remaining() > 0 {
+        return Err(Error::ProtocolViolation(format!(
+            "message type {msg_type:#x} has {} unconsumed trailing bytes",
+            payload.remaining()
+        )));
+    }
 
     Ok((msg, total_consumed))
 }

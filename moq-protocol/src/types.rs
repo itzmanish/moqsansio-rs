@@ -91,12 +91,19 @@ impl Decode for TrackNamespace {
             )));
         }
         let mut fields = Vec::with_capacity(count);
+        let mut total_bytes: usize = 0;
         for _ in 0..count {
             let field = cursor.read_prefixed_bytes()?.to_vec();
             if field.is_empty() {
                 return Err(Error::ProtocolViolation(
                     "track namespace field must not be empty".into(),
                 ));
+            }
+            total_bytes += field.len();
+            if total_bytes > MAX_FULL_TRACK_NAME_BYTES {
+                return Err(Error::ProtocolViolation(format!(
+                    "track namespace total length {total_bytes} exceeds {MAX_FULL_TRACK_NAME_BYTES}"
+                )));
             }
             fields.push(field);
         }
@@ -130,8 +137,20 @@ impl Decode for TrackNamespacePrefix {
             )));
         }
         let mut fields = Vec::with_capacity(count);
+        let mut total_bytes: usize = 0;
         for _ in 0..count {
             let field = cursor.read_prefixed_bytes()?.to_vec();
+            if field.is_empty() {
+                return Err(Error::ProtocolViolation(
+                    "track namespace field must not be empty".into(),
+                ));
+            }
+            total_bytes += field.len();
+            if total_bytes > MAX_FULL_TRACK_NAME_BYTES {
+                return Err(Error::ProtocolViolation(format!(
+                    "track namespace total length {total_bytes} exceeds {MAX_FULL_TRACK_NAME_BYTES}"
+                )));
+            }
             fields.push(field);
         }
         Ok(Self { fields })

@@ -88,9 +88,9 @@ pub enum RequestErrorCode {
     DoesNotExist = 0x10,
     InvalidRange = 0x11,
     MalformedTrack = 0x12,
-    Uninterested = 0x15,
-    PrefixOverlap = 0x16,
-    InvalidJoiningRequestId = 0x17,
+    Uninterested = 0x20,
+    PrefixOverlap = 0x30,
+    InvalidJoiningRequestId = 0x32,
     DuplicateSubscription = 0x19,
 }
 
@@ -110,9 +110,9 @@ impl RequestErrorCode {
             0x10 => Some(Self::DoesNotExist),
             0x11 => Some(Self::InvalidRange),
             0x12 => Some(Self::MalformedTrack),
-            0x15 => Some(Self::Uninterested),
-            0x16 => Some(Self::PrefixOverlap),
-            0x17 => Some(Self::InvalidJoiningRequestId),
+            0x20 => Some(Self::Uninterested),
+            0x30 => Some(Self::PrefixOverlap),
+            0x32 => Some(Self::InvalidJoiningRequestId),
             0x19 => Some(Self::DuplicateSubscription),
             _ => None,
         }

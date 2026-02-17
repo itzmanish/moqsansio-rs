@@ -144,7 +144,16 @@ impl Encode for FetchOk {
 impl Decode for FetchOk {
     fn decode(cursor: &mut Cursor<'_>) -> Result<Self> {
         let request_id = cursor.read_varint()?;
-        let end_of_track = cursor.read_u8()? != 0;
+        let eot_byte = cursor.read_u8()?;
+        let end_of_track = match eot_byte {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(Error::ProtocolViolation(format!(
+                    "FETCH_OK End Of Track must be 0 or 1, got {eot_byte}"
+                )));
+            }
+        };
         let end_location = Location::decode(cursor)?;
         let parameters = Parameters::decode(cursor)?;
         let track_extensions = decode_extensions_from_remaining(cursor)?;
