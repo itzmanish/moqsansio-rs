@@ -9,7 +9,7 @@ use moq_protocol::message::setup::{ClientSetup, ServerSetup};
 use moq_protocol::message::subscribe::{Subscribe, SubscribeOk};
 use moq_protocol::message::ControlMessage;
 use moq_protocol::params::Parameters;
-use moq_protocol::types::TrackNamespace;
+use moq_protocol::types::{KeyValuePair, Location, TrackNamespace};
 
 use crate::events::*;
 use crate::route::*;
@@ -79,7 +79,27 @@ impl<S: SessionKey> Relay<S> {
                 channel,
                 message,
             } => self.on_control_message(session, channel, message),
-            InputEvent::SubscriptionObjectReceived { .. } => vec![],
+            InputEvent::SubscriptionObjectReceived {
+                session,
+                track_alias,
+                subgroup_id,
+                location,
+                forwarding_preference,
+                publisher_priority,
+                object_status,
+                extensions,
+                payload,
+            } => self.on_subscription_object(
+                session,
+                track_alias,
+                subgroup_id,
+                location,
+                forwarding_preference,
+                publisher_priority,
+                object_status,
+                extensions,
+                payload,
+            ),
             InputEvent::FetchObjectReceived { .. } => vec![],
         }
     }
@@ -177,6 +197,80 @@ impl<S: SessionKey> Relay<S> {
         });
 
         self.sessions.remove(&session);
+        out
+    }
+
+    // -----------------------------------------------------------------------
+    // Data plane: object forwarding (§8.4, §8.7)
+    // -----------------------------------------------------------------------
+
+    /// Forward an object from a publisher to all established downstream subscribers.
+    ///
+    /// §8.4: "Relays use the Track Alias of an incoming Object to identify its
+    /// Track and find the current subscribers. Each new Object is forwarded to
+    /// each subscriber."
+    /// §8.4: "A relay MUST NOT reorder or drop objects received on a multi-object stream."
+    /// §8.7: "A relay MUST NOT modify Object properties when forwarding."
+    #[allow(clippy::too_many_arguments)]
+    fn on_subscription_object(
+        &mut self,
+        session: S,
+        track_alias: TrackAlias,
+        subgroup_id: Option<u64>,
+        location: Location,
+        forwarding_preference: ForwardingPreference,
+        publisher_priority: Option<u8>,
+        object_status: ObjectStatus,
+        extensions: Vec<KeyValuePair>,
+        payload: Vec<u8>,
+    ) -> Vec<OutputEvent<S>> {
+        // Look up the publisher session's inbound alias → TrackKey (§10.1)
+        let track_key = match self
+            .sessions
+            .get(&session)
+            .and_then(|sess| sess.inbound_aliases.get(&track_alias))
+        {
+            Some(tk) => tk.clone(),
+            None => {
+                // Unknown track alias — protocol violation per §10.1
+                return vec![OutputEvent::CloseSession {
+                    session,
+                    error: SessionError::ProtocolViolation,
+                    reason: "object received with unknown track alias".into(),
+                }];
+            }
+        };
+
+        let route = match self.tracks.get(&track_key) {
+            Some(r) => r,
+            None => return vec![],
+        };
+
+        // Fan out to all established downstream subscribers that have an outbound alias
+        let mut out = Vec::new();
+        for ds in route.downstream_subs.values() {
+            if ds.state != DownstreamSubState::Established {
+                continue;
+            }
+            let outbound_alias = match ds.outbound_alias {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // §8.7: pass through all properties unchanged, only translate track_alias
+            out.push(OutputEvent::SendSubscriptionObject {
+                session: ds.id.session.clone(),
+                track_alias: outbound_alias,
+                subgroup_id,
+                location: location.clone(),
+                forwarding_preference,
+                publisher_priority,
+                object_status,
+                extensions: extensions.clone(),
+                payload: payload.clone(),
+            });
+        }
+
         out
     }
 
@@ -2153,5 +2247,773 @@ mod tests {
             name: b"video".to_vec(),
         };
         assert!(relay.track_route(&track_key).is_some());
+    }
+
+    // =======================================================================
+    // Phase 2c: Data plane — object forwarding tests
+    // =======================================================================
+
+    /// Sets up: publisher(1) PUBLISH_NAMESPACE → subscriber(2) SUBSCRIBE → SUBSCRIBE_OK.
+    /// Returns the outbound track alias assigned to subscriber 2.
+    fn setup_established_sub(relay: &mut Relay<u32>) -> TrackAlias {
+        open_server_session(relay, 1);
+        complete_setup(relay, 1);
+        open_server_session(relay, 2);
+        complete_setup(relay, 2);
+
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::PublishNamespace(PublishNamespace {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com"]).unwrap(),
+                parameters: Parameters::new(),
+            }),
+        });
+
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 2,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::Subscribe(Subscribe {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com", "room"]).unwrap(),
+                track_name: b"video".to_vec(),
+                parameters: Parameters::new(),
+            }),
+        });
+
+        let out = relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::SubscribeOk(SubscribeOk {
+                request_id: 1,
+                track_alias: 42,
+                parameters: Parameters::new(),
+                track_extensions: vec![],
+            }),
+        });
+
+        // Extract the outbound alias from SUBSCRIBE_OK sent to subscriber
+        match &out[0] {
+            OutputEvent::SendControlMessage { message, .. } => match message {
+                ControlMessage::SubscribeOk(ok) => TrackAlias(ok.track_alias),
+                _ => panic!("expected SubscribeOk"),
+            },
+            _ => panic!("expected SendControlMessage"),
+        }
+    }
+
+    #[test]
+    fn object_forwarded_to_single_subscriber() {
+        let mut relay = Relay::new(test_config());
+        let sub_alias = setup_established_sub(&mut relay);
+
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 1,
+                object: 0,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: Some(128),
+            object_status: ObjectStatus::Normal,
+            extensions: vec![],
+            payload: b"hello world".to_vec(),
+        });
+
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OutputEvent::SendSubscriptionObject {
+                session,
+                track_alias,
+                subgroup_id,
+                location,
+                forwarding_preference,
+                publisher_priority,
+                object_status,
+                extensions,
+                payload,
+            } => {
+                assert_eq!(*session, 2);
+                assert_eq!(*track_alias, sub_alias);
+                assert_eq!(*subgroup_id, Some(0));
+                assert_eq!(location.group, 1);
+                assert_eq!(location.object, 0);
+                assert_eq!(*forwarding_preference, ForwardingPreference::Subgroup);
+                assert_eq!(*publisher_priority, Some(128));
+                assert_eq!(*object_status, ObjectStatus::Normal);
+                assert!(extensions.is_empty());
+                assert_eq!(payload, b"hello world");
+            }
+            _ => panic!("expected SendSubscriptionObject"),
+        }
+    }
+
+    #[test]
+    fn object_forwarded_to_multiple_subscribers() {
+        let mut relay = Relay::new(test_config());
+
+        // Publisher 1
+        open_server_session(&mut relay, 1);
+        complete_setup(&mut relay, 1);
+
+        // Subscribers 2, 3
+        open_server_session(&mut relay, 2);
+        complete_setup(&mut relay, 2);
+        open_server_session(&mut relay, 3);
+        complete_setup(&mut relay, 3);
+
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::PublishNamespace(PublishNamespace {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com"]).unwrap(),
+                parameters: Parameters::new(),
+            }),
+        });
+
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 2,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::Subscribe(Subscribe {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com", "room"]).unwrap(),
+                track_name: b"video".to_vec(),
+                parameters: Parameters::new(),
+            }),
+        });
+
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 3,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::Subscribe(Subscribe {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com", "room"]).unwrap(),
+                track_name: b"video".to_vec(),
+                parameters: Parameters::new(),
+            }),
+        });
+
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::SubscribeOk(SubscribeOk {
+                request_id: 1,
+                track_alias: 42,
+                parameters: Parameters::new(),
+                track_extensions: vec![],
+            }),
+        });
+
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 5,
+                object: 3,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: Some(200),
+            object_status: ObjectStatus::Normal,
+            extensions: vec![],
+            payload: b"fanout data".to_vec(),
+        });
+
+        assert_eq!(out.len(), 2);
+        let sessions: HashSet<u32> = out
+            .iter()
+            .filter_map(|e| match e {
+                OutputEvent::SendSubscriptionObject { session, .. } => Some(*session),
+                _ => None,
+            })
+            .collect();
+        assert!(sessions.contains(&2));
+        assert!(sessions.contains(&3));
+
+        // Verify all forwarded objects preserve properties
+        for ev in &out {
+            match ev {
+                OutputEvent::SendSubscriptionObject {
+                    location,
+                    forwarding_preference,
+                    publisher_priority,
+                    object_status,
+                    payload,
+                    ..
+                } => {
+                    assert_eq!(location.group, 5);
+                    assert_eq!(location.object, 3);
+                    assert_eq!(*forwarding_preference, ForwardingPreference::Subgroup);
+                    assert_eq!(*publisher_priority, Some(200));
+                    assert_eq!(*object_status, ObjectStatus::Normal);
+                    assert_eq!(payload, b"fanout data");
+                }
+                _ => panic!("expected SendSubscriptionObject"),
+            }
+        }
+    }
+
+    #[test]
+    fn object_with_unknown_alias_closes_session() {
+        let mut relay = Relay::new(test_config());
+        setup_established_sub(&mut relay);
+
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(999),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 0,
+                object: 0,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: None,
+            object_status: ObjectStatus::Normal,
+            extensions: vec![],
+            payload: vec![],
+        });
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            OutputEvent::CloseSession {
+                session: 1,
+                error: SessionError::ProtocolViolation,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn object_not_forwarded_to_terminated_subscriber() {
+        let mut relay = Relay::new(test_config());
+        setup_established_sub(&mut relay);
+
+        // Subscriber unsubscribes
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 2,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::Unsubscribe(Unsubscribe { request_id: 0 }),
+        });
+
+        // Object arrives after unsubscribe — should not be forwarded
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 0,
+                object: 0,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: None,
+            object_status: ObjectStatus::Normal,
+            extensions: vec![],
+            payload: vec![],
+        });
+
+        // Track route was cleaned up after unsubscribe (upstream terminated too),
+        // so no forwarding target remains → empty output
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn object_not_forwarded_to_pending_subscriber() {
+        let mut relay = Relay::new(test_config());
+
+        // Publisher 1 and subscribers 2, 3
+        open_server_session(&mut relay, 1);
+        complete_setup(&mut relay, 1);
+        open_server_session(&mut relay, 2);
+        complete_setup(&mut relay, 2);
+        open_server_session(&mut relay, 3);
+        complete_setup(&mut relay, 3);
+
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::PublishNamespace(PublishNamespace {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com"]).unwrap(),
+                parameters: Parameters::new(),
+            }),
+        });
+
+        // Sub 2 subscribes
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 2,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::Subscribe(Subscribe {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com", "room"]).unwrap(),
+                track_name: b"video".to_vec(),
+                parameters: Parameters::new(),
+            }),
+        });
+
+        // Publisher confirms → sub 2 gets SUBSCRIBE_OK
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::SubscribeOk(SubscribeOk {
+                request_id: 1,
+                track_alias: 42,
+                parameters: Parameters::new(),
+                track_extensions: vec![],
+            }),
+        });
+
+        // Sub 3 subscribes (gets immediate SUBSCRIBE_OK since upstream already established)
+        relay.on_event(InputEvent::ControlMessageReceived {
+            session: 3,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::Subscribe(Subscribe {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com", "room"]).unwrap(),
+                track_name: b"video".to_vec(),
+                parameters: Parameters::new(),
+            }),
+        });
+
+        // Both should be Established — object should go to both
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 0,
+                object: 0,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: None,
+            object_status: ObjectStatus::Normal,
+            extensions: vec![],
+            payload: b"data".to_vec(),
+        });
+
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn end_of_group_status_preserved() {
+        let mut relay = Relay::new(test_config());
+        let sub_alias = setup_established_sub(&mut relay);
+
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 1,
+                object: 5,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: Some(128),
+            object_status: ObjectStatus::EndOfGroup,
+            extensions: vec![],
+            payload: vec![],
+        });
+
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OutputEvent::SendSubscriptionObject {
+                track_alias,
+                object_status,
+                payload,
+                ..
+            } => {
+                assert_eq!(*track_alias, sub_alias);
+                assert_eq!(*object_status, ObjectStatus::EndOfGroup);
+                assert!(payload.is_empty());
+            }
+            _ => panic!("expected SendSubscriptionObject"),
+        }
+    }
+
+    #[test]
+    fn end_of_track_status_preserved() {
+        let mut relay = Relay::new(test_config());
+        let _sub_alias = setup_established_sub(&mut relay);
+
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 2,
+                object: 0,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: Some(128),
+            object_status: ObjectStatus::EndOfTrack,
+            extensions: vec![],
+            payload: vec![],
+        });
+
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OutputEvent::SendSubscriptionObject { object_status, .. } => {
+                assert_eq!(*object_status, ObjectStatus::EndOfTrack);
+            }
+            _ => panic!("expected SendSubscriptionObject"),
+        }
+    }
+
+    #[test]
+    fn datagram_forwarding_no_subgroup_id() {
+        let mut relay = Relay::new(test_config());
+        let sub_alias = setup_established_sub(&mut relay);
+
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: None,
+            location: Location {
+                group: 0,
+                object: 0,
+            },
+            forwarding_preference: ForwardingPreference::Datagram,
+            publisher_priority: Some(64),
+            object_status: ObjectStatus::Normal,
+            extensions: vec![],
+            payload: b"datagram payload".to_vec(),
+        });
+
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OutputEvent::SendSubscriptionObject {
+                session,
+                track_alias,
+                subgroup_id,
+                forwarding_preference,
+                payload,
+                ..
+            } => {
+                assert_eq!(*session, 2);
+                assert_eq!(*track_alias, sub_alias);
+                assert_eq!(*subgroup_id, None);
+                assert_eq!(*forwarding_preference, ForwardingPreference::Datagram);
+                assert_eq!(payload, b"datagram payload");
+            }
+            _ => panic!("expected SendSubscriptionObject"),
+        }
+    }
+
+    #[test]
+    fn extensions_preserved_through_forwarding() {
+        use moq_protocol::types::{KeyValuePair, KvValue};
+        let mut relay = Relay::new(test_config());
+        let _sub_alias = setup_established_sub(&mut relay);
+
+        let exts = vec![
+            KeyValuePair {
+                key: 1,
+                value: KvValue::Varint(42),
+            },
+            KeyValuePair {
+                key: 2,
+                value: KvValue::Bytes(b"custom".to_vec()),
+            },
+        ];
+
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 0,
+                object: 0,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: None,
+            object_status: ObjectStatus::Normal,
+            extensions: exts.clone(),
+            payload: vec![],
+        });
+
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OutputEvent::SendSubscriptionObject { extensions, .. } => {
+                assert_eq!(extensions.len(), 2);
+                assert_eq!(*extensions, exts);
+            }
+            _ => panic!("expected SendSubscriptionObject"),
+        }
+    }
+
+    #[test]
+    fn e2e_publish_subscribe_forward_unsubscribe() {
+        let mut relay = Relay::new(test_config());
+
+        // 1. Open publisher and subscriber sessions
+        open_server_session(&mut relay, 1);
+        complete_setup(&mut relay, 1);
+        open_server_session(&mut relay, 2);
+        complete_setup(&mut relay, 2);
+
+        // 2. Publisher registers namespace
+        let out = relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::PublishNamespace(PublishNamespace {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com"]).unwrap(),
+                parameters: Parameters::new(),
+            }),
+        });
+        assert_eq!(out.len(), 1); // REQUEST_OK
+
+        // 3. Subscriber subscribes
+        let out = relay.on_event(InputEvent::ControlMessageReceived {
+            session: 2,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::Subscribe(Subscribe {
+                request_id: 0,
+                track_namespace: TrackNamespace::from_strings(&["example.com", "room"]).unwrap(),
+                track_name: b"video".to_vec(),
+                parameters: Parameters::new(),
+            }),
+        });
+        assert_eq!(out.len(), 1); // upstream SUBSCRIBE to publisher
+        let upstream_req_id = match &out[0] {
+            OutputEvent::SendControlMessage { message, .. } => match message {
+                ControlMessage::Subscribe(sub) => sub.request_id,
+                _ => panic!("expected Subscribe"),
+            },
+            _ => panic!("expected SendControlMessage"),
+        };
+
+        // 4. Publisher confirms subscription
+        let out = relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::SubscribeOk(SubscribeOk {
+                request_id: upstream_req_id,
+                track_alias: 42,
+                parameters: Parameters::new(),
+                track_extensions: vec![],
+            }),
+        });
+        assert_eq!(out.len(), 1); // SUBSCRIBE_OK downstream
+        let sub_alias = match &out[0] {
+            OutputEvent::SendControlMessage {
+                session, message, ..
+            } => {
+                assert_eq!(*session, 2);
+                match message {
+                    ControlMessage::SubscribeOk(ok) => TrackAlias(ok.track_alias),
+                    _ => panic!("expected SubscribeOk"),
+                }
+            }
+            _ => panic!("expected SendControlMessage"),
+        };
+
+        // 5. Publisher sends multiple objects — relay forwards each
+        for obj_id in 0..5 {
+            let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+                session: 1,
+                track_alias: TrackAlias(42),
+                subgroup_id: Some(0),
+                location: Location {
+                    group: 0,
+                    object: obj_id,
+                },
+                forwarding_preference: ForwardingPreference::Subgroup,
+                publisher_priority: Some(128),
+                object_status: ObjectStatus::Normal,
+                extensions: vec![],
+                payload: format!("frame-{}", obj_id).into_bytes(),
+            });
+
+            assert_eq!(out.len(), 1);
+            match &out[0] {
+                OutputEvent::SendSubscriptionObject {
+                    session,
+                    track_alias,
+                    location,
+                    payload,
+                    ..
+                } => {
+                    assert_eq!(*session, 2);
+                    assert_eq!(*track_alias, sub_alias);
+                    assert_eq!(location.group, 0);
+                    assert_eq!(location.object, obj_id);
+                    assert_eq!(*payload, format!("frame-{}", obj_id).into_bytes());
+                }
+                _ => panic!("expected SendSubscriptionObject"),
+            }
+        }
+
+        // 6. Publisher sends EndOfGroup
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 1,
+            track_alias: TrackAlias(42),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 0,
+                object: 5,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: Some(128),
+            object_status: ObjectStatus::EndOfGroup,
+            extensions: vec![],
+            payload: vec![],
+        });
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OutputEvent::SendSubscriptionObject { object_status, .. } => {
+                assert_eq!(*object_status, ObjectStatus::EndOfGroup)
+            }
+            _ => panic!("expected SendSubscriptionObject"),
+        }
+
+        // 7. Subscriber unsubscribes
+        let out = relay.on_event(InputEvent::ControlMessageReceived {
+            session: 2,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::Unsubscribe(Unsubscribe { request_id: 0 }),
+        });
+        assert_eq!(out.len(), 1); // upstream UNSUBSCRIBE
+        match &out[0] {
+            OutputEvent::SendControlMessage {
+                session, message, ..
+            } => {
+                assert_eq!(*session, 1);
+                assert!(matches!(message, ControlMessage::Unsubscribe(_)));
+            }
+            _ => panic!("expected Unsubscribe"),
+        }
+
+        // 8. Track route cleaned up
+        let track_key = TrackKey {
+            namespace: TrackNamespace::from_strings(&["example.com", "room"]).unwrap(),
+            name: b"video".to_vec(),
+        };
+        assert!(relay.track_route(&track_key).is_none());
+    }
+
+    #[test]
+    fn e2e_publish_done_terminates_forwarding() {
+        let mut relay = Relay::new(test_config());
+        setup_established_sub(&mut relay);
+
+        // Send a few objects
+        for i in 0..3 {
+            let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+                session: 1,
+                track_alias: TrackAlias(42),
+                subgroup_id: Some(0),
+                location: Location {
+                    group: 0,
+                    object: i,
+                },
+                forwarding_preference: ForwardingPreference::Subgroup,
+                publisher_priority: Some(128),
+                object_status: ObjectStatus::Normal,
+                extensions: vec![],
+                payload: vec![i as u8],
+            });
+            assert_eq!(out.len(), 1);
+        }
+
+        // Publisher sends PUBLISH_DONE
+        let out = relay.on_event(InputEvent::ControlMessageReceived {
+            session: 1,
+            channel: ControlChannel::ControlStream,
+            message: ControlMessage::PublishDone(PublishDone {
+                request_id: 1,
+                status_code: 0,
+                stream_count: 1,
+                error_reason: moq_protocol::types::ReasonPhrase("done".into()),
+            }),
+        });
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            OutputEvent::SendControlMessage {
+                session, message, ..
+            } => {
+                assert_eq!(*session, 2);
+                assert!(matches!(message, ControlMessage::PublishDone(_)));
+            }
+            _ => panic!("expected PublishDone"),
+        }
+
+        // Track should be cleaned up
+        let track_key = TrackKey {
+            namespace: TrackNamespace::from_strings(&["example.com", "room"]).unwrap(),
+            name: b"video".to_vec(),
+        };
+        assert!(relay.track_route(&track_key).is_none());
+    }
+
+    #[test]
+    fn object_from_unknown_session_closes_session() {
+        let mut relay = Relay::new(test_config());
+
+        // Session 99 never opened
+        let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+            session: 99,
+            track_alias: TrackAlias(1),
+            subgroup_id: Some(0),
+            location: Location {
+                group: 0,
+                object: 0,
+            },
+            forwarding_preference: ForwardingPreference::Subgroup,
+            publisher_priority: None,
+            object_status: ObjectStatus::Normal,
+            extensions: vec![],
+            payload: vec![],
+        });
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            OutputEvent::CloseSession {
+                session: 99,
+                error: SessionError::ProtocolViolation,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn multiple_objects_preserve_ordering() {
+        let mut relay = Relay::new(test_config());
+        setup_established_sub(&mut relay);
+
+        let mut received_locations = vec![];
+        for obj_id in 0..10u64 {
+            let out = relay.on_event(InputEvent::SubscriptionObjectReceived {
+                session: 1,
+                track_alias: TrackAlias(42),
+                subgroup_id: Some(0),
+                location: Location {
+                    group: 0,
+                    object: obj_id,
+                },
+                forwarding_preference: ForwardingPreference::Subgroup,
+                publisher_priority: Some(128),
+                object_status: ObjectStatus::Normal,
+                extensions: vec![],
+                payload: vec![],
+            });
+
+            assert_eq!(out.len(), 1);
+            match &out[0] {
+                OutputEvent::SendSubscriptionObject { location, .. } => {
+                    received_locations.push((location.group, location.object));
+                }
+                _ => panic!("expected SendSubscriptionObject"),
+            }
+        }
+
+        // §8.4: MUST NOT reorder objects — verify order preserved
+        let expected: Vec<(u64, u64)> = (0..10).map(|i| (0, i)).collect();
+        assert_eq!(received_locations, expected);
     }
 }

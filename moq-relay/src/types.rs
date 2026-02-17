@@ -74,6 +74,55 @@ impl EndpointRole {
     }
 }
 
+/// Object Status per spec §10.2.1.1.
+///
+/// Allows the publisher to explicitly communicate that a specific range
+/// of objects does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStatus {
+    /// 0x0 — Normal object. Implicit for any non-zero length object.
+    /// Zero-length objects explicitly encode the Normal status.
+    Normal,
+    /// 0x3 — End of Group. No objects with the same Group ID and an Object ID
+    /// greater than or equal to the one specified exist.
+    EndOfGroup,
+    /// 0x4 — End of Track. No objects with a location equal to or greater
+    /// than the one specified exist.
+    EndOfTrack,
+}
+
+impl ObjectStatus {
+    pub fn from_u64(v: u64) -> Option<Self> {
+        match v {
+            0x0 => Some(Self::Normal),
+            0x3 => Some(Self::EndOfGroup),
+            0x4 => Some(Self::EndOfTrack),
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(self) -> u64 {
+        match self {
+            Self::Normal => 0x0,
+            Self::EndOfGroup => 0x3,
+            Self::EndOfTrack => 0x4,
+        }
+    }
+}
+
+/// Object Forwarding Preference per spec §10.2.1.
+///
+/// An enumeration indicating how a publisher sends an object.
+/// In a subscription, an Object MUST be sent according to its
+/// Object Forwarding Preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardingPreference {
+    /// Object is sent on a Subgroup stream (§10.4.2).
+    Subgroup,
+    /// Object is sent in a Datagram (§10.3).
+    Datagram,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlChannel {
     ControlStream,
